@@ -2,8 +2,9 @@
    GEO DETECTIVE AGENCY — content
    Teachers: this is the file to edit!
    - Add or change cases in the CASES array below.
-   - Each case needs: 3 "sort" items, 6 questions (2 per lens),
-     and 1 "ask" item with exactly one option marked good: true.
+   - Each case needs: a map target (lat/lon/zoom/radius in km + a
+     "lookFor" observation prompt), 3 "sort" items, 6 questions
+     (2 per lens), and 1 "ask" item with exactly one option good: true.
    - If you change how many cases/questions there are, adjust the
      badge targets at the bottom so they stay reachable.
    ============================================================ */
@@ -20,6 +21,10 @@ const CASES = [
     title: "The Case of the Green Ribbon",
     place: "The Nile River · Egypt",
     emoji: "🏜️",
+    map: {
+      lat: 25.7, lon: 32.6, zoom: 5, radius: 800,
+      lookFor: "Zoom out a little on the satellite view: can you spot the skinny green ribbon crossing the tan desert, and its fan-shaped end (the delta) at the sea?",
+    },
     intro:
       "From space, Egypt looks like a huge tan desert with one bright green ribbon running through it — and almost everyone in Egypt lives on that ribbon. Your job, detective: figure out where it is, why it's there, and why it matters to YOU.",
     sort: [
@@ -113,6 +118,10 @@ const CASES = [
     title: "The Case of the City Below the Sea",
     place: "New Orleans · United States",
     emoji: "🎺",
+    map: {
+      lat: 29.95, lon: -90.07, zoom: 9, radius: 500,
+      lookFor: "Look how the city squeezes between the winding river, the big lake above it, and the gulf below. Where is the water NOT?",
+    },
     intro:
       "New Orleans sits where the mighty Mississippi River meets the Gulf of Mexico — and parts of the city are actually LOWER than the sea. Detective, find out where it is, why anyone built a city there, and how it touches your life.",
     sort: [
@@ -206,6 +215,10 @@ const CASES = [
     title: "The Case of the Wobbling Islands",
     place: "Japan · Asia-Pacific",
     emoji: "🗾",
+    map: {
+      lat: 36.5, lon: 138.0, zoom: 5, radius: 800,
+      lookFor: "Trace the chain of islands. Switch views and notice how mountains fill the middle, leaving only thin flat edges along the coasts for cities.",
+    },
     intro:
       "Japan is a chain of islands where the ground sometimes shakes, mountains smoke, and skyscrapers are built to sway like trees. Where is it? Why is it so shaky? And what does it have to do with your family's car or your video games?",
     sort: [
@@ -299,6 +312,10 @@ const CASES = [
     title: "The Case of the Breathing Forest",
     place: "The Amazon Rainforest · South America",
     emoji: "🦜",
+    map: {
+      lat: -3.5, lon: -62.0, zoom: 4, radius: 1200,
+      lookFor: "That deep green carpet is the rainforest. Can you follow the giant river east until it pours into the Atlantic?",
+    },
     intro:
       "The Amazon rainforest is so big and so green that it helps make its own weather — some people call it a giant set of lungs for the planet. Find out where it hides, why it grows there, and why your snack shelf cares.",
     sort: [
@@ -392,6 +409,10 @@ const CASES = [
     title: "The Case of the Fire-and-Ice Island",
     place: "Iceland · North Atlantic",
     emoji: "🌋",
+    map: {
+      lat: 64.9, lon: -18.6, zoom: 5, radius: 600,
+      lookFor: "An island all alone in the cold North Atlantic. Spot the white glaciers sitting on top of the dark volcanic land.",
+    },
     intro:
       "Iceland has glaciers on top and melted rock below. People there heat their homes and swimming pools with the Earth itself! Where is this island? Why is it so steamy? And what could it teach your town?",
     sort: [
@@ -518,6 +539,13 @@ const BADGES = [
     progress: (s) => [solvedCount(s, "matters"), 8],
   },
   {
+    id: "navigator", emoji: "🗺️", name: "World Navigator",
+    concept: "Pinpointing places on a world map",
+    desc: "Pin 4 case places inside the target zone on the world map.",
+    check: (s) => pinCount(s) >= 4,
+    progress: (s) => [pinCount(s), 4],
+  },
+  {
     id: "asker", emoji: "❓", name: "Question Master",
     concept: "Asking strong geographic questions",
     desc: "Pick the strongest question in 4 cases on the first try.",
@@ -536,12 +564,12 @@ const BADGES = [
     concept: "All concepts attained",
     desc: "Earn every badge above and close all 5 cases.",
     check: (s) =>
-      ["sorter", "locator", "sleuth", "champ", "asker", "comeback"].every((b) => s.badges[b]) &&
+      ["sorter", "locator", "sleuth", "champ", "asker", "comeback", "navigator"].every((b) => s.badges[b]) &&
       CASES.every((c) => s.stamps[c.id]),
     progress: (s) => [
-      ["sorter", "locator", "sleuth", "champ", "asker", "comeback"].filter((b) => s.badges[b]).length +
+      ["sorter", "locator", "sleuth", "champ", "asker", "comeback", "navigator"].filter((b) => s.badges[b]).length +
         CASES.filter((c) => s.stamps[c.id]).length,
-      11,
+      12,
     ],
   },
 ];

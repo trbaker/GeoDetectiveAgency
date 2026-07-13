@@ -359,3 +359,45 @@ button:focus-visible { outline: 3px solid var(--where); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ---------- interactive maps ---------- */
+
+.map-box {
+  height: 320px;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 2px solid var(--line);
+  margin: 0 0 12px;
+  background: #DCE9EF;
+  position: relative;
+}
+.map-box.tall { height: 400px; }
+@media (max-width: 520px) {
+  .map-box { height: 250px; }
+  .map-box.tall { height: 320px; }
+}
+
+.map-note {
+  font-size: 14.5px;
+  background: #F5F9FB;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  text-align: left;
+}
+
+.map-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--faint);
+  padding: 20px;
+  text-align: center;
+  font-size: 15px;
+}
+
+.map-toggle { margin-bottom: 12px; }
+
+.pin-skip { display: block; margin: 6px auto 0; }

@@ -12,6 +12,7 @@ const DEFAULT_SAVE = {
   qstatus: {},   // questionId -> 'first' | 'recovered' | 'missed'
   sortFirst: 0,  // sort items classified correctly on the first try (max 15)
   askFirst: 0,   // "pick the strongest question" first tries (max 5)
+  pins: {},      // caseId -> 'first' | 'recovered' | 'missed' (map pin challenge)
   stamps: {},    // caseId -> true (case closed)
   badges: {},    // badgeId -> true
 };
@@ -70,6 +71,197 @@ function missedIds(save) {
   return Object.entries(save.qstatus).filter(([, st]) => st === "missed").map(([id]) => id);
 }
 
+function pinCount(save) {
+  return Object.values(save.pins || {}).filter((v) => v === "first" || v === "recovered").length;
+}
+
+/* ---------------- MAPS (ArcGIS Maps SDK + Esri public REST tile services) ----------------
+   Basemaps come straight from Esri's public REST endpoints, so no API key is needed.
+   If the SDK can't load (blocked network, offline), every map gracefully falls back
+   and students can continue — the map steps are never a wall. */
+
+const IMAGERY_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer";
+const TOPO_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer";
+
+let activeViews = [];
+
+function destroyActiveViews() {
+  activeViews.forEach((v) => { try { v.destroy(); } catch (e) {} });
+  activeViews = [];
+}
+
+function withMapModules(cb, attempt = 0) {
+  // The SDK <script> may still be downloading on slow networks — wait up to ~5s.
+  if (!window.require) {
+    if (attempt < 24) return void setTimeout(() => withMapModules(cb, attempt + 1), 500);
+    return cb(null);
+  }
+  try {
+    window.require(
+      ["esri/Map", "esri/views/MapView", "esri/layers/TileLayer", "esri/Basemap", "esri/Graphic"],
+      (Map, MapView, TileLayer, Basemap, Graphic) => cb({ Map, MapView, TileLayer, Basemap, Graphic }),
+      () => cb(null)
+    );
+  } catch (e) {
+    cb(null);
+  }
+}
+
+function mapFallback(el, extraHtml) {
+  if (el) el.innerHTML = `<div class="map-fallback">🗺️ The interactive map couldn't load on this network — the case continues without it!${extraHtml || ""}</div>`;
+}
+
+function markerGraphic(G, lat, lon, style) {
+  const symbols = {
+    place: { type: "simple-marker", color: "#D64545", size: "16px", outline: { color: "white", width: 2 } },
+    guessMiss: { type: "simple-marker", color: "#C53030", size: "12px", outline: { color: "white", width: 2 } },
+    guessHit: { type: "simple-marker", color: "#2F855A", size: "14px", outline: { color: "white", width: 2 } },
+    target: { type: "simple-marker", style: "diamond", color: "#F0B429", size: "20px", outline: { color: "#1F3347", width: 2 } },
+  };
+  return new G({ geometry: { type: "point", latitude: lat, longitude: lon }, symbol: symbols[style] });
+}
+
+function haversineKm(a, b) {
+  const R = 6371, toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat), dLon = toRad(b.lon - a.lon);
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+function compassDir(from, to) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLon = toRad(to.lon - from.lon);
+  const y = Math.sin(dLon) * Math.cos(toRad(to.lat));
+  const x = Math.cos(toRad(from.lat)) * Math.sin(toRad(to.lat)) - Math.sin(toRad(from.lat)) * Math.cos(toRad(to.lat)) * Math.cos(dLon);
+  const brng = ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+  const dirs = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"];
+  return dirs[Math.round(brng / 45) % 8];
+}
+
+function fmtMiles(km) {
+  const mi = km * 0.621371;
+  return Math.max(50, Math.round(mi / 50) * 50).toLocaleString() + " miles";
+}
+
+function normLon(lon) {
+  return ((lon + 180) % 360 + 360) % 360 - 180;
+}
+
+function initExploreMap(c) {
+  const el = document.getElementById("exploreMap");
+  if (!el) return;
+  withMapModules((M) => {
+    if (!document.body.contains(el)) return; // user navigated away while loading
+    if (!M) return mapFallback(el);
+    try {
+      const imagery = new M.TileLayer({ url: IMAGERY_URL });
+      const topo = new M.TileLayer({ url: TOPO_URL, visible: false });
+      const map = new M.Map({ basemap: new M.Basemap({ baseLayers: [imagery, topo] }) });
+      const view = new M.MapView({
+        container: el, map,
+        center: [c.map.lon, c.map.lat], zoom: c.map.zoom,
+        constraints: { minZoom: 2 },
+        popupEnabled: false,
+      });
+      view.ui.components = ["zoom", "attribution"];
+      view.graphics.add(markerGraphic(M.Graphic, c.map.lat, c.map.lon, "place"));
+      view.when(null, () => mapFallback(el));
+      activeViews.push(view);
+      const toggle = document.getElementById("mapToggle");
+      if (toggle) {
+        toggle.addEventListener("click", () => {
+          const sat = imagery.visible;
+          imagery.visible = !sat;
+          topo.visible = sat;
+          toggle.textContent = sat ? "🛰️ Switch to satellite" : "🗺️ Switch to map view";
+        });
+      }
+    } catch (e) {
+      mapFallback(el);
+    }
+  });
+}
+
+function initPinMap(c) {
+  const el = document.getElementById("pinMap");
+  if (!el) return;
+  withMapModules((M) => {
+    if (!document.body.contains(el)) return;
+    if (!M) return mapFallback(el, "<br>Use the skip button below to keep going.");
+    try {
+      const map = new M.Map({ basemap: new M.Basemap({ baseLayers: [new M.TileLayer({ url: IMAGERY_URL })] }) });
+      const view = new M.MapView({
+        container: el, map,
+        center: [10, 15], zoom: 1,
+        constraints: { minZoom: 1, maxZoom: 8 },
+        popupEnabled: false,
+      });
+      view.ui.components = ["zoom", "attribution"];
+      view.when(null, () => mapFallback(el, "<br>Use the skip button below to keep going."));
+      activeViews.push(view);
+
+      view.on("click", (evt) => {
+        if (!evt.mapPoint || ui.pin.resolved) return;
+        const guess = { lat: evt.mapPoint.latitude, lon: normLon(evt.mapPoint.longitude) };
+        if (guess.lat == null) return;
+        handlePinGuess(view, M.Graphic, c, guess);
+      });
+    } catch (e) {
+      mapFallback(el, "<br>Use the skip button below to keep going.");
+    }
+  });
+}
+
+function recordPin(caseId, status) {
+  const rank = { first: 3, recovered: 2, missed: 1 };
+  const old = save.pins[caseId];
+  if (!old || rank[status] > rank[old]) save.pins[caseId] = status;
+  commit();
+}
+
+function handlePinGuess(view, Graphic, c, guess) {
+  const p = ui.pin;
+  const target = { lat: c.map.lat, lon: c.map.lon };
+  p.tries++;
+  const d = haversineKm(guess, target);
+  const inZone = d <= c.map.radius;
+  view.graphics.add(markerGraphic(Graphic, guess.lat, guess.lon, inZone ? "guessHit" : "guessMiss"));
+  const fb = document.getElementById("pinFeedback");
+  if (!fb) return;
+
+  if (inZone) {
+    p.resolved = p.tries === 1 ? "first" : "recovered";
+    view.graphics.add(markerGraphic(Graphic, target.lat, target.lon, "target"));
+    view.goTo({ center: [target.lon, target.lat], zoom: 4 }).catch(() => {});
+    recordPin(c.id, p.resolved);
+    fb.innerHTML = `
+      <div class="result-box win">
+        <div class="result-title">${p.tries === 1 ? "🎯 Bullseye on the first try!" : "💪 Pinned it! Hints + second looks = detective skill."}</div>
+        Your pin landed about ${fmtMiles(d)} from the gold star — inside the target zone. That's how a geographer reads coastlines and continent shapes!
+      </div>
+      <button class="btn-big" data-action="pin-next">On to the questions ➜</button>`;
+  } else if (p.tries >= 3) {
+    p.resolved = "missed";
+    view.graphics.add(markerGraphic(Graphic, target.lat, target.lon, "target"));
+    view.goTo({ center: [target.lon, target.lat], zoom: 3 }).catch(() => {});
+    recordPin(c.id, "missed");
+    fb.innerHTML = `
+      <div class="result-box lose">
+        <div class="result-title">📌 The gold star shows the real spot.</div>
+        Your closest pin was about ${fmtMiles(p.best == null ? d : Math.min(p.best, d))} away. Take a good look at where it really is — every pin teaches your brain the map, and you can replay this case to try again!
+      </div>
+      <button class="btn-big" data-action="pin-next">On to the questions ➜</button>`;
+  } else {
+    const warm = p.lastDist != null ? (d < p.lastDist ? "🔥 Warmer! " : "🧊 Colder! ") : "";
+    fb.innerHTML = `
+      <div class="hint-box">
+        ${warm}Your pin is about <b>${fmtMiles(d)}</b> from ${esc(c.place.split("·")[0].trim())}. Head <b>${compassDir(guess, target)}</b> and try again. (Try ${p.tries} of 3)
+      </div>`;
+  }
+  p.best = p.best == null ? d : Math.min(p.best, d);
+  p.lastDist = d;
+}
+
 const LENS_TOTALS = (() => {
   const t = { where: 0, why: 0, matters: 0 };
   CASES.forEach((c) => c.questions.forEach((q) => t[q.lens]++));
@@ -100,8 +292,9 @@ let save = loadSave();
 const ui = {
   screen: "home",          // home | case | notebook | practice
   caseId: null,
-  phase: "intro",          // intro | sort | quiz | ask | report
+  phase: "intro",          // intro | pin | sort | quiz | ask | report
   qi: 0,
+  pin: { tries: 0, best: null, lastDist: null, resolved: null, skipped: false },
   local: null,             // per-case results: { qstatusLocal:{}, sortFirst:0, askFirst:false }
   sort: { idx: 0, wrong: [], resolved: null, firstCount: 0 },
   quiz: { picked: [], done: null },       // shared by case quiz + practice
@@ -222,8 +415,24 @@ function renderIntro(c) {
       <div class="case-title">${esc(c.title)}</div>
       <div class="case-place">${esc(c.place)}</div>
       <p class="intro-text">${esc(c.intro)}</p>
+      <div class="map-note">🔭 <b>Scope out the scene:</b> ${esc(c.map.lookFor)}</div>
+      <div id="exploreMap" class="map-box" aria-label="Interactive map of ${esc(c.place)}"></div>
+      <button class="btn-pill gold map-toggle" id="mapToggle" type="button">🗺️ Switch to map view</button>
       <div class="chip-row">${chip("where")}${chip("why")}${chip("matters")}</div>
-      <button class="btn-big" data-action="start-sort">Take the case 🕵️</button>
+      <button class="btn-big" data-action="start-pin">Take the case 🕵️</button>
+    </div>`;
+}
+
+function renderPin(c) {
+  return `
+    <button class="btn-back" data-action="go-home">← Leave case (finish all 4 steps to save it)</button>
+    <div class="card">
+      <div class="step-label">STEP 1 · PIN THE PLACE</div>
+      <div class="q-text">Where in the world is ${esc(c.place.split("·")[0].trim())}? Tap the map to drop your pin!</div>
+      <p class="muted">No labels on this map, detective — read the shapes of the continents, coastlines, and colors like a real geographer. You get 3 tries, with a distance-and-direction hint after each one.</p>
+      <div id="pinMap" class="map-box tall" aria-label="World map — click where you think the place is"></div>
+      <div id="pinFeedback"></div>
+      <button class="btn-back pin-skip" data-action="pin-skip">Map not loading or want to move on? Skip this step ➜</button>
     </div>`;
 }
 
@@ -254,9 +463,9 @@ function renderSort(c) {
     : "";
 
   return `
-    <button class="btn-back" data-action="go-home">← Leave case (finish all 3 steps to save it)</button>
+    <button class="btn-back" data-action="go-home">← Leave case (finish all 4 steps to save it)</button>
     <div class="card">
-      <div class="step-label">STEP 1 · SORT THE QUESTIONS (${s.idx + 1} of ${c.sort.length})</div>
+      <div class="step-label">STEP 2 · SORT THE QUESTIONS (${s.idx + 1} of ${c.sort.length})</div>
       <p class="muted">Detectives know their question types. Which kind of geographic question is this?</p>
       <div class="q-text">“${esc(item.q)}”</div>
       ${buttons}
@@ -296,7 +505,7 @@ function renderQuizQuestion(question, headerHtml, nextAction, backAction, extraT
   }
 
   return `
-    <button class="btn-back" data-action="${backAction}">← ${backAction === "go-home" ? "Back to HQ" : "Leave case (finish all 3 steps to save it)"}</button>
+    <button class="btn-back" data-action="${backAction}">← ${backAction === "go-home" ? "Back to HQ" : "Leave case (finish all 4 steps to save it)"}</button>
     ${extraTopHtml || ""}
     <div class="card">
       <div class="q-head">
@@ -337,9 +546,9 @@ function renderAsk(c) {
     : "";
 
   return `
-    <button class="btn-back" data-action="go-home">← Leave case (finish all 3 steps to save it)</button>
+    <button class="btn-back" data-action="go-home">← Leave case (finish all 4 steps to save it)</button>
     <div class="card">
-      <div class="step-label">STEP 3 · YOU ASK THE QUESTIONS</div>
+      <div class="step-label">STEP 4 · YOU ASK THE QUESTIONS</div>
       <div class="q-text">${esc(c.ask.prompt)}</div>
       ${buttons}
       ${hint}
@@ -368,6 +577,12 @@ function renderReport(c) {
     ? "A flawless investigation — try the next case, and keep asking why places are the way they are!"
     : `Your trickiest clue type was "${LENSES[weakest].label}" — ${missed} question${missed > 1 ? "s" : ""} went to your Cold Case Files. Visit them from HQ to crack them and level up!`;
 
+  const pinLine =
+    ui.pin.resolved === "first" ? "🗺️ Map pin: 🎯 bullseye on the first try!" :
+    ui.pin.resolved === "recovered" ? "🗺️ Map pin: found it using the hints — that's map sense growing!" :
+    ui.pin.resolved === "missed" ? "🗺️ Map pin: the star showed you the spot. Replay the case to pin it yourself!" :
+    "🗺️ Map pin: skipped this time — try it on your next case!";
+
   return `
     <div class="card">
       <div class="center" style="margin-bottom:8px">
@@ -377,6 +592,7 @@ function renderReport(c) {
         <div class="stamp-big">★ CASE CLOSED ★</div>
       </div>
       <div style="margin:18px 0">${meters}</div>
+      <div class="tip-box">${pinLine}</div>
       <div class="tip-box"><b>🕵️ Detective's tip for next time:</b> ${tip}</div>
       <button class="btn-big" data-action="go-home">Back to HQ ➜</button>
     </div>`;
@@ -428,6 +644,8 @@ function renderNotebook() {
       ${lensMeters}
       <div class="meter-label" style="margin-top:4px"><span>🧭 Question sorting (first-try)</span><span>${save.sortFirst} / ${SORT_TOTAL}</span></div>
       <div style="margin:4px 0 10px">${meter(save.sortFirst, SORT_TOTAL, "#F0B429")}</div>
+      <div class="meter-label"><span>🗺️ Places pinned on the map</span><span>${pinCount(save)} / ${CASES.length}</span></div>
+      <div style="margin:4px 0 10px">${meter(pinCount(save), CASES.length, "#F0B429")}</div>
       <div class="meter-label"><span>💪 Comebacks (fixed mistakes)</span><span>${recoveredCount(save)}</span></div>
     </div>
     <div class="card">
@@ -462,6 +680,7 @@ function renderPractice() {
 const app = document.getElementById("app");
 
 function render() {
+  destroyActiveViews(); // tear down any live map before replacing the DOM
   let html = "";
   if (ui.screen === "home") html = renderHome();
   else if (ui.screen === "notebook") html = renderNotebook();
@@ -469,11 +688,12 @@ function render() {
   else if (ui.screen === "case") {
     const c = currentCase();
     if (ui.phase === "intro") html = renderIntro(c);
+    else if (ui.phase === "pin") html = renderPin(c);
     else if (ui.phase === "sort") html = renderSort(c);
     else if (ui.phase === "quiz") {
       html = renderQuizQuestion(
         c.questions[ui.qi],
-        `STEP 2 · CLUE ${ui.qi + 1} of ${c.questions.length}`,
+        `STEP 3 · CLUE ${ui.qi + 1} of ${c.questions.length}`,
         "quiz-next",
         "go-home"
       );
@@ -482,6 +702,8 @@ function render() {
     else if (ui.phase === "report") html = renderReport(c);
   }
   app.innerHTML = html;
+  if (document.getElementById("exploreMap")) initExploreMap(currentCase());
+  if (document.getElementById("pinMap")) initPinMap(currentCase());
   window.scrollTo({ top: 0 });
 }
 
@@ -507,12 +729,20 @@ const actions = {
     ui.phase = "intro";
     ui.qi = 0;
     ui.local = { qstatusLocal: {}, sortFirst: 0, askFirst: false };
+    ui.pin = { tries: 0, best: null, lastDist: null, resolved: null, skipped: false };
     ui.sort = { idx: 0, wrong: [], resolved: null, firstCount: 0 };
     ui.ask = { picked: [], resolved: null };
     resetQuiz();
   },
 
-  "start-sort": () => { ui.phase = "sort"; },
+  "start-pin": () => { ui.phase = "pin"; },
+
+  "pin-next": () => { ui.phase = "sort"; },
+
+  "pin-skip": () => {
+    ui.pin.skipped = true;
+    ui.phase = "sort";
+  },
 
   "sort-pick": (lensKey) => {
     const s = ui.sort;
