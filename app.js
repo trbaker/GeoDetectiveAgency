@@ -6,6 +6,7 @@
 
 /* ---------------- SAVE / STORAGE ---------------- */
 
+const BUILD = 3; // bump when redeploying so the footer shows which version is live
 const SAVE_KEY = "geodetective:save";
 
 const DEFAULT_SAVE = {
@@ -75,50 +76,236 @@ function pinCount(save) {
   return Object.values(save.pins || {}).filter((v) => v === "first" || v === "recovered").length;
 }
 
-/* ---------------- MAPS (ArcGIS Maps SDK + Esri public REST tile services) ----------------
-   Basemaps come straight from Esri's public REST endpoints, so no API key is needed.
-   If the SDK can't load (blocked network, offline), every map gracefully falls back
-   and students can continue — the map steps are never a wall. */
+/* ---------------- MAPS (ArcGIS REST tile services, zero dependencies) ----------------
+   Basemap tiles come straight from Esri's public ArcGIS REST services
+   (server.arcgisonline.com) and are drawn by a tiny built-in tile viewer.
+   No SDK, no loader, no API key — just standard Web Mercator tiles at
+   {service}/tile/{z}/{y}/{x}, so the maps work anywhere the site loads.
+   Esri attribution is displayed on every map. */
 
-const IMAGERY_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer";
-const TOPO_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer";
+const TILE_SIZE = 256;
+const BASEMAPS = {
+  imagery: {
+    url: "https://server.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/tile",
+    attr: "Powered by Esri | Esri, Maxar, Earthstar Geographics, GIS User Community",
+  },
+  topo: {
+    url: "https://server.arcgisonline.com/arcgis/rest/services/World_Topo_Map/MapServer/tile",
+    attr: "Powered by Esri | Esri, HERE, Garmin, FAO, NOAA, USGS",
+  },
+};
+
+/* Web Mercator math (standard XYZ tile scheme) */
+function lonToWorldX(lon, z) { return ((lon + 180) / 360) * TILE_SIZE * Math.pow(2, z); }
+function latToWorldY(lat, z) {
+  const r = (Math.max(-85.05, Math.min(85.05, lat)) * Math.PI) / 180;
+  const merc = Math.log(Math.tan(Math.PI / 4 + r / 2));
+  return ((1 - merc / Math.PI) / 2) * TILE_SIZE * Math.pow(2, z);
+}
+function worldXToLon(x, z) { return (x / (TILE_SIZE * Math.pow(2, z))) * 360 - 180; }
+function worldYToLat(y, z) {
+  const n = Math.PI * (1 - (2 * y) / (TILE_SIZE * Math.pow(2, z)));
+  return (Math.atan(Math.sinh(n)) * 180) / Math.PI;
+}
 
 let activeViews = [];
-
 function destroyActiveViews() {
   activeViews.forEach((v) => { try { v.destroy(); } catch (e) {} });
   activeViews = [];
 }
 
-function withMapModules(cb, attempt = 0) {
-  // The SDK <script> may still be downloading on slow networks — wait up to ~5s.
-  if (!window.require) {
-    if (attempt < 24) return void setTimeout(() => withMapModules(cb, attempt + 1), 500);
-    return cb(null);
-  }
-  try {
-    window.require(
-      ["esri/Map", "esri/views/MapView", "esri/layers/TileLayer", "esri/Basemap", "esri/Graphic"],
-      (Map, MapView, TileLayer, Basemap, Graphic) => cb({ Map, MapView, TileLayer, Basemap, Graphic }),
-      () => cb(null)
-    );
-  } catch (e) {
-    cb(null);
-  }
-}
+class MiniMap {
+  constructor(el, opts) {
+    this.el = el;
+    this.center = { lat: opts.lat, lon: opts.lon };
+    this.zoom = opts.zoom;
+    this.minZoom = opts.minZoom != null ? opts.minZoom : 1;
+    this.maxZoom = opts.maxZoom != null ? opts.maxZoom : 12;
+    this.basemap = opts.basemap || "imagery";
+    this.onClick = null;
+    this.markers = [];
+    this.tilePool = {};
+    this.tilesLoaded = 0;
+    this.tilesTried = 0;
+    this.tilesErrored = 0;
 
-function mapFallback(el, extraHtml) {
-  if (el) el.innerHTML = `<div class="map-fallback">🗺️ The interactive map couldn't load on this network — the case continues without it!${extraHtml || ""}</div>`;
-}
+    el.classList.add("mini-map");
+    if (opts.crosshair) el.classList.add("crosshair");
+    el.innerHTML = `
+      <div class="mm-tiles"></div>
+      <div class="mm-markers"></div>
+      <div class="mm-zoom">
+        <button type="button" class="mm-in" aria-label="Zoom in">+</button>
+        <button type="button" class="mm-out" aria-label="Zoom out">−</button>
+      </div>
+      <div class="mm-attr"></div>
+      <div class="mm-offline" hidden>🗺️ Map tiles couldn't load on this network — no worries, detectives adapt! The case continues without them.</div>`;
+    this.tilesEl = el.querySelector(".mm-tiles");
+    this.markersEl = el.querySelector(".mm-markers");
+    this.attrEl = el.querySelector(".mm-attr");
+    this.offlineEl = el.querySelector(".mm-offline");
+    this.attrEl.textContent = BASEMAPS[this.basemap].attr;
 
-function markerGraphic(G, lat, lon, style) {
-  const symbols = {
-    place: { type: "simple-marker", color: "#D64545", size: "16px", outline: { color: "white", width: 2 } },
-    guessMiss: { type: "simple-marker", color: "#C53030", size: "12px", outline: { color: "white", width: 2 } },
-    guessHit: { type: "simple-marker", color: "#2F855A", size: "14px", outline: { color: "white", width: 2 } },
-    target: { type: "simple-marker", style: "diamond", color: "#F0B429", size: "20px", outline: { color: "#1F3347", width: 2 } },
-  };
-  return new G({ geometry: { type: "point", latitude: lat, longitude: lon }, symbol: symbols[style] });
+    el.querySelector(".mm-in").addEventListener("click", () => this.setZoom(this.zoom + 1));
+    el.querySelector(".mm-out").addEventListener("click", () => this.setZoom(this.zoom - 1));
+
+    /* drag to pan; a short press without movement counts as a click */
+    this._down = null;
+    el.addEventListener("pointerdown", (e) => {
+      if (e.target.closest(".mm-zoom") || e.target.closest(".mm-offline") || e.target.closest(".mm-attr")) return;
+      this._down = { x: e.clientX, y: e.clientY, moved: false, t: Date.now() };
+      if (el.setPointerCapture) { try { el.setPointerCapture(e.pointerId); } catch (err) {} }
+    });
+    el.addEventListener("pointermove", (e) => {
+      if (!this._down) return;
+      const dx = e.clientX - this._down.x, dy = e.clientY - this._down.y;
+      if (!this._down.moved && Math.abs(dx) + Math.abs(dy) <= 4) return;
+      this._down.moved = true;
+      this._down.x = e.clientX; this._down.y = e.clientY;
+      const z = this.zoom;
+      const cx = lonToWorldX(this.center.lon, z) - dx;
+      const cy = latToWorldY(this.center.lat, z) - dy;
+      this.center = { lat: worldYToLat(cy, z), lon: worldXToLon(cx, z) };
+      this.render();
+    });
+    el.addEventListener("pointerup", (e) => {
+      if (!this._down) return;
+      const wasClick = !this._down.moved && Date.now() - this._down.t < 700;
+      this._down = null;
+      if (wasClick && this.onClick) {
+        const rect = el.getBoundingClientRect();
+        const p = this.screenToLatLon(e.clientX - rect.left, e.clientY - rect.top);
+        this.onClick(p.lat, p.lon);
+      }
+    });
+    el.addEventListener("pointercancel", () => { this._down = null; });
+
+    this._wheelLock = 0;
+    el.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const now = Date.now();
+      if (now - this._wheelLock < 250) return;
+      this._wheelLock = now;
+      this.setZoom(this.zoom + (e.deltaY < 0 ? 1 : -1));
+    }, { passive: false });
+    el.addEventListener("dblclick", () => this.setZoom(this.zoom + 1));
+
+    this._onResize = () => this.render();
+    window.addEventListener("resize", this._onResize);
+
+    /* if not a single tile arrives, say so (but keep trying quietly) */
+    this._offlineTimer = setTimeout(() => {
+      if (this.tilesTried > 0 && this.tilesLoaded === 0) {
+        const any = Object.values(this.tilePool)[0];
+        this.showOffline(any ? any.src : BASEMAPS[this.basemap].url + "/1/0/0");
+      }
+    }, 8000);
+
+    this.render();
+  }
+
+  showOffline(sampleUrl) {
+    if (!this.offlineEl || !this.offlineEl.hidden) return;
+    console.error("Geo Detective: map tiles failed to load from", sampleUrl);
+    this.offlineEl.innerHTML = `🗺️ Map tiles couldn't load on this network — no worries, detectives adapt! The case continues without them.<br><br><a href="${sampleUrl}" target="_blank" rel="noopener" style="color:#9FD3F0">Tap here to test the map service directly</a> — if a photo of Earth appears, tell your teacher to check the game's network settings.`;
+    this.offlineEl.hidden = false;
+  }
+
+  destroy() {
+    clearTimeout(this._offlineTimer);
+    window.removeEventListener("resize", this._onResize);
+    this.el.classList.remove("mini-map", "crosshair");
+    this.el.innerHTML = "";
+  }
+
+  size() { return { w: this.el.clientWidth || 640, h: this.el.clientHeight || 320 }; }
+
+  setZoom(z) {
+    this.zoom = Math.max(this.minZoom, Math.min(this.maxZoom, z));
+    this.render();
+  }
+
+  setView(lat, lon, zoom) {
+    this.center = { lat, lon };
+    if (zoom != null) this.zoom = Math.max(this.minZoom, Math.min(this.maxZoom, zoom));
+    this.render();
+  }
+
+  setBasemap(key) {
+    this.basemap = key;
+    this.attrEl.textContent = BASEMAPS[key].attr;
+    Object.values(this.tilePool).forEach((img) => img.remove());
+    this.tilePool = {};
+    this.render();
+  }
+
+  screenToLatLon(px, py) {
+    const { w, h } = this.size(), z = this.zoom;
+    const x = lonToWorldX(this.center.lon, z) + (px - w / 2);
+    const y = latToWorldY(this.center.lat, z) + (py - h / 2);
+    return { lat: worldYToLat(y, z), lon: worldXToLon(x, z) };
+  }
+
+  addMarker(lat, lon, cls, text) {
+    const m = document.createElement("div");
+    m.className = "mm-marker " + cls;
+    if (text) m.textContent = text;
+    this.markersEl.appendChild(m);
+    this.markers.push({ lat, lon, el: m });
+    this.positionMarkers();
+  }
+
+  positionMarkers() {
+    const { w, h } = this.size(), z = this.zoom;
+    const cx = lonToWorldX(this.center.lon, z), cy = latToWorldY(this.center.lat, z);
+    const world = TILE_SIZE * Math.pow(2, z);
+    this.markers.forEach((m) => {
+      let x = lonToWorldX(m.lon, z) - cx;
+      if (x > world / 2) x -= world;   // show the marker on the nearest copy
+      if (x < -world / 2) x += world;  // of the wrapped world
+      const y = latToWorldY(m.lat, z) - cy;
+      m.el.style.transform = `translate(${Math.round(w / 2 + x)}px, ${Math.round(h / 2 + y)}px)`;
+    });
+  }
+
+  render() {
+    const { w, h } = this.size(), z = this.zoom;
+    const n = Math.pow(2, z);
+    const left = lonToWorldX(this.center.lon, z) - w / 2;
+    const top = latToWorldY(this.center.lat, z) - h / 2;
+    const x0 = Math.floor(left / TILE_SIZE) - 1, x1 = Math.floor((left + w) / TILE_SIZE) + 1;
+    const y0 = Math.max(0, Math.floor(top / TILE_SIZE) - 1);
+    const y1 = Math.min(n - 1, Math.floor((top + h) / TILE_SIZE) + 1);
+    const keep = {};
+    for (let ty = y0; ty <= y1; ty++) {
+      for (let tx = x0; tx <= x1; tx++) {
+        const wrapX = ((tx % n) + n) % n; // wrap tiles across the date line
+        const key = `${this.basemap}:${z}:${wrapX}:${ty}:${tx}`;
+        keep[key] = true;
+        let img = this.tilePool[key];
+        if (!img) {
+          img = document.createElement("img");
+          img.alt = "";
+          img.decoding = "async";
+          img.draggable = false;
+          this.tilesTried++;
+          img.addEventListener("load", () => { this.tilesLoaded++; if (this.offlineEl) this.offlineEl.hidden = true; });
+          img.addEventListener("error", () => {
+            this.tilesErrored++;
+            if (this.tilesLoaded === 0 && this.tilesErrored >= 6) this.showOffline(img.src);
+          });
+          img.src = `${BASEMAPS[this.basemap].url}/${z}/${ty}/${wrapX}`;
+          this.tilePool[key] = img;
+          this.tilesEl.appendChild(img);
+        }
+        img.style.transform = `translate(${Math.round(tx * TILE_SIZE - left)}px, ${Math.round(ty * TILE_SIZE - top)}px)`;
+      }
+    }
+    Object.keys(this.tilePool).forEach((key) => {
+      if (!keep[key]) { this.tilePool[key].remove(); delete this.tilePool[key]; }
+    });
+    this.positionMarkers();
+  }
 }
 
 function haversineKm(a, b) {
@@ -150,66 +337,35 @@ function normLon(lon) {
 function initExploreMap(c) {
   const el = document.getElementById("exploreMap");
   if (!el) return;
-  withMapModules((M) => {
-    if (!document.body.contains(el)) return; // user navigated away while loading
-    if (!M) return mapFallback(el);
-    try {
-      const imagery = new M.TileLayer({ url: IMAGERY_URL });
-      const topo = new M.TileLayer({ url: TOPO_URL, visible: false });
-      const map = new M.Map({ basemap: new M.Basemap({ baseLayers: [imagery, topo] }) });
-      const view = new M.MapView({
-        container: el, map,
-        center: [c.map.lon, c.map.lat], zoom: c.map.zoom,
-        constraints: { minZoom: 2 },
-        popupEnabled: false,
-      });
-      view.ui.components = ["zoom", "attribution"];
-      view.graphics.add(markerGraphic(M.Graphic, c.map.lat, c.map.lon, "place"));
-      view.when(null, () => mapFallback(el));
-      activeViews.push(view);
-      const toggle = document.getElementById("mapToggle");
-      if (toggle) {
-        toggle.addEventListener("click", () => {
-          const sat = imagery.visible;
-          imagery.visible = !sat;
-          topo.visible = sat;
-          toggle.textContent = sat ? "🛰️ Switch to satellite" : "🗺️ Switch to map view";
-        });
-      }
-    } catch (e) {
-      mapFallback(el);
-    }
+  const mm = new MiniMap(el, {
+    lat: c.map.lat, lon: c.map.lon, zoom: c.map.zoom,
+    minZoom: 2, maxZoom: 12, basemap: "imagery",
   });
+  mm.addMarker(c.map.lat, c.map.lon, "mk-place", "📍");
+  activeViews.push(mm);
+  const toggle = document.getElementById("mapToggle");
+  if (toggle) {
+    toggle.addEventListener("click", () => {
+      const toTopo = mm.basemap === "imagery";
+      mm.setBasemap(toTopo ? "topo" : "imagery");
+      toggle.textContent = toTopo ? "🛰️ Switch to satellite" : "🗺️ Switch to map view";
+    });
+  }
 }
 
 function initPinMap(c) {
   const el = document.getElementById("pinMap");
   if (!el) return;
-  withMapModules((M) => {
-    if (!document.body.contains(el)) return;
-    if (!M) return mapFallback(el, "<br>Use the skip button below to keep going.");
-    try {
-      const map = new M.Map({ basemap: new M.Basemap({ baseLayers: [new M.TileLayer({ url: IMAGERY_URL })] }) });
-      const view = new M.MapView({
-        container: el, map,
-        center: [10, 15], zoom: 1,
-        constraints: { minZoom: 1, maxZoom: 8 },
-        popupEnabled: false,
-      });
-      view.ui.components = ["zoom", "attribution"];
-      view.when(null, () => mapFallback(el, "<br>Use the skip button below to keep going."));
-      activeViews.push(view);
-
-      view.on("click", (evt) => {
-        if (!evt.mapPoint || ui.pin.resolved) return;
-        const guess = { lat: evt.mapPoint.latitude, lon: normLon(evt.mapPoint.longitude) };
-        if (guess.lat == null) return;
-        handlePinGuess(view, M.Graphic, c, guess);
-      });
-    } catch (e) {
-      mapFallback(el, "<br>Use the skip button below to keep going.");
-    }
+  const startZoom = (el.clientWidth || 600) >= 700 ? 2 : 1;
+  const mm = new MiniMap(el, {
+    lat: 20, lon: 10, zoom: startZoom,
+    minZoom: 1, maxZoom: 8, basemap: "imagery", crosshair: true,
   });
+  mm.onClick = (lat, lon) => {
+    if (ui.pin.resolved) return;
+    handlePinGuess(mm, c, { lat, lon: normLon(lon) });
+  };
+  activeViews.push(mm);
 }
 
 function recordPin(caseId, status) {
@@ -219,20 +375,20 @@ function recordPin(caseId, status) {
   commit();
 }
 
-function handlePinGuess(view, Graphic, c, guess) {
+function handlePinGuess(mm, c, guess) {
   const p = ui.pin;
   const target = { lat: c.map.lat, lon: c.map.lon };
   p.tries++;
   const d = haversineKm(guess, target);
   const inZone = d <= c.map.radius;
-  view.graphics.add(markerGraphic(Graphic, guess.lat, guess.lon, inZone ? "guessHit" : "guessMiss"));
+  mm.addMarker(guess.lat, guess.lon, inZone ? "mk-hit" : "mk-miss");
   const fb = document.getElementById("pinFeedback");
   if (!fb) return;
 
   if (inZone) {
     p.resolved = p.tries === 1 ? "first" : "recovered";
-    view.graphics.add(markerGraphic(Graphic, target.lat, target.lon, "target"));
-    view.goTo({ center: [target.lon, target.lat], zoom: 4 }).catch(() => {});
+    mm.addMarker(target.lat, target.lon, "mk-target", "⭐");
+    mm.setView(target.lat, target.lon, Math.max(mm.zoom, 4));
     recordPin(c.id, p.resolved);
     fb.innerHTML = `
       <div class="result-box win">
@@ -242,8 +398,8 @@ function handlePinGuess(view, Graphic, c, guess) {
       <button class="btn-big" data-action="pin-next">On to the questions ➜</button>`;
   } else if (p.tries >= 3) {
     p.resolved = "missed";
-    view.graphics.add(markerGraphic(Graphic, target.lat, target.lon, "target"));
-    view.goTo({ center: [target.lon, target.lat], zoom: 3 }).catch(() => {});
+    mm.addMarker(target.lat, target.lon, "mk-target", "⭐");
+    mm.setView(target.lat, target.lon, 3);
     recordPin(c.id, "missed");
     fb.innerHTML = `
       <div class="result-box lose">
@@ -404,7 +560,7 @@ function renderHome() {
     <div class="section-title">Open a case file:</div>
     <div class="case-grid">${cards}</div>
 
-    <p class="footnote">Wrong answers are never the end — they become Cold Cases you can still crack. Detectives improve with every clue. 🕵️</p>`;
+    <p class="footnote">Wrong answers are never the end — they become Cold Cases you can still crack. Detectives improve with every clue. 🕵️<br><span style="opacity:0.6">map build ${BUILD} · tiles by Esri</span></p>`;
 }
 
 function renderIntro(c) {

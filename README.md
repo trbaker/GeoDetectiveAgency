@@ -25,7 +25,9 @@ Built with plain HTML, CSS, and JavaScript — no build step, no dependencies.
 
 ## About the maps
 
-The maps use the **ArcGIS Maps SDK for JavaScript** (loaded from Esri's CDN) with Esri's public **World Imagery** and **World Topographic** REST tile services (`server.arcgisonline.com`). No API key or Esri account is required, and Esri's attribution is displayed automatically on each map. If a network blocks the SDK or tile services, the game detects it, shows a friendly note, and lets students skip the map step with no penalty — everything else keeps working.
+The maps are built directly on **ArcGIS REST services**: Esri's public **World Imagery** and **World Topographic** tile endpoints at `server.arcgisonline.com` (standard Web Mercator tiles at `.../MapServer/tile/{z}/{y}/{x}`). A small tile viewer built into `app.js` handles panning, zooming, tap-to-pin, and markers — there is **no external mapping library at all**, so there's nothing extra to download, no loader timing issues, and no API key or Esri account required. Esri attribution is displayed on every map, as their terms require.
+
+If a network blocks the tile service entirely, the map shows a friendly note after a few seconds and students can skip any map step with no penalty — everything else keeps working.
 
 Progress saves automatically in the browser via `localStorage` — each student's progress lives on their own device/browser profile. Clearing browser data resets it.
 

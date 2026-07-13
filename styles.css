@@ -401,3 +401,90 @@ button:focus-visible { outline: 3px solid var(--where); outline-offset: 2px; }
 .map-toggle { margin-bottom: 12px; }
 
 .pin-skip { display: block; margin: 6px auto 0; }
+
+/* ---------- built-in tile viewer (MiniMap) ---------- */
+
+.mini-map {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #0E2A38;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grab;
+}
+.mini-map:active { cursor: grabbing; }
+.mini-map.crosshair { cursor: crosshair; }
+
+.mm-tiles, .mm-markers { position: absolute; inset: 0; }
+.mm-markers { pointer-events: none; z-index: 3; }
+
+.mm-tiles img {
+  position: absolute;
+  left: 0; top: 0;
+  width: 256px; height: 256px;
+  pointer-events: none;
+  -webkit-user-drag: none;
+}
+
+.mm-marker { position: absolute; left: 0; top: 0; }
+.mk-place { font-size: 30px; line-height: 1; margin-left: -15px; margin-top: -28px; filter: drop-shadow(0 2px 2px rgba(0,0,0,0.45)); }
+.mk-target { font-size: 28px; line-height: 1; margin-left: -14px; margin-top: -14px; filter: drop-shadow(0 2px 2px rgba(0,0,0,0.45)); }
+.mk-hit, .mk-miss {
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  border: 2.5px solid #fff;
+  margin-left: -8px; margin-top: -8px;
+  box-shadow: 0 1px 5px rgba(0,0,0,0.55);
+}
+.mk-hit { background: var(--good); }
+.mk-miss { background: var(--bad); }
+
+.mm-zoom {
+  position: absolute;
+  top: 10px; left: 10px;
+  display: flex; flex-direction: column; gap: 6px;
+  z-index: 5;
+}
+.mm-zoom button {
+  width: 36px; height: 36px;
+  border-radius: 10px;
+  border: 2px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+  font-size: 20px; font-weight: 800;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+}
+
+.mm-attr {
+  position: absolute;
+  right: 0; bottom: 0;
+  z-index: 5;
+  background: rgba(255,255,255,0.85);
+  color: #33475B;
+  font-size: 10px;
+  padding: 2px 7px;
+  border-top-left-radius: 8px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mm-offline {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 20px;
+  color: #fff;
+  background: rgba(14, 42, 56, 0.92);
+  font-size: 15px;
+}
+.mm-offline[hidden] { display: none; }
